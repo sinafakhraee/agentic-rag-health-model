@@ -8,3 +8,9 @@ mcp-server/__pycache__/
 .venv/
 *.pyc
 .ipynb_checkpoints/
+
+# Editor/tooling artifacts
+anaconda_projects/
+
+# Research PDFs are NOT redistributed — download them into papers/ (see papers/README.md)
+papers/*.pdf

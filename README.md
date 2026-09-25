@@ -350,9 +350,10 @@ but **no alerts** — you investigate them from the graph once the root alert po
 ```
 AgenticRAGHealthModeling/
 ├─ README.md                        · this file
+├─ LICENSE                          · MIT (code + docs); the papers keep their own licenses
 ├─ .env.example                     · configuration template (copy to .env)
 ├─ agentic_rag_health_demo.ipynb    · the demo + failure scenarios
-├─ papers/                          · research PDFs ingested into the knowledge base
+├─ papers/                          · download the source PDFs here (papers/README.md) — not bundled (licensing)
 ├─ images/                          · portal screenshots referenced by this README
 ├─ mcp-server/
 │  ├─ server.py                     · scholarly-papers MCP server (FastMCP, streamable-HTTP)
@@ -407,7 +408,9 @@ az containerapp up -n agrag-scholar-mcp -g healthmodels --source mcp-server `
   --ingress external --target-port 3000 --env-vars MCP_TRANSPORT=http
 az containerapp update -n agrag-scholar-mcp -g healthmodels --min-replicas 1 --max-replicas 3
 
-# 4. Ingest the papers into a Foundry IQ knowledge base (keyless embeddings).
+# 4. Download the source PDFs into papers/ — they are NOT bundled (see papers/README.md for
+#    links + licenses) — then ingest them into a Foundry IQ knowledge base (keyless embeddings).
+foreach ($id in '1706.03762','2404.01268','2412.19437','2506.21734') { Invoke-WebRequest "https://arxiv.org/pdf/$id" -OutFile "papers/$id.pdf" }
 python infra/ingest_papers.py
 
 # 5. Deploy the health model (entities, signals, alerts, canary probe).
