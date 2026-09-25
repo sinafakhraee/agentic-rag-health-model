@@ -9,8 +9,6 @@ request path touches several Azure services — and "is the app healthy?" is a m
 question than "is each resource up?". This PoC builds the workload, then layers a health
 model on top that turns raw telemetry into one rolled-up answer an on-call engineer can trust.
 
-> Everything here is net-new and deploys into its own resource group (`healthmodels`). No
-> keys live in code — every hop uses managed identity + RBAC. Configuration comes from `.env`.
 
 ---
 
