@@ -1,0 +1,6 @@
+# Portal screenshots referenced by ../README.md:
+#   scenario0-healthy-graph.png     — graph: healthy baseline (every entity green)
+#   scenario1-latency-graph.png     — graph: primary Degraded (time-to-last-byte)
+#   scenario1-latency-signals.png   — entity Signals: Time to last byte Degraded (~19,019 ms)
+#   scenario2-throttle-graph.png    — graph: primary Unhealthy (429), pool/root Degraded
+#   scenario2-throttle-signals.png  — entity Signals: 429 throttling Unhealthy (533 in 5 min)

@@ -1,0 +1,63 @@
+<!--
+    Agentic RAG Responses API - HA gateway policy.
+
+    Backend is the load-balanced POOL 'agrag-responses-pool' (primary priority 1,
+    secondary priority 2) with per-backend circuit breakers, so the gateway fails
+    over across the two Azure OpenAI regions on 429/5xx/transport errors.
+
+      * rewrite-uri -> /openai/v1/responses
+      * set-backend-service -> the POOL
+      * keyless to both AIServices backends via APIM managed identity (audience https://ai.azure.com)
+      * adds X-Backend-Host / X-Backend-Retry so a client can observe which region served + failover
+      * request body is passed through UNCHANGED; buffer-request-body=true so the exact payload
+        survives an APIM retry across backends
+
+    HTTP handling: 200 ok | 400/401/403/404 no retry | 408 retry | 409 retry only if Retry-After
+      | 429 retry/failover | 499 retry | 500/502/503/504 retry/failover | exhausted 5xx/transport -> 503
+-->
+<policies>
+    <inbound>
+        <base />
+        <rewrite-uri template="/openai/v1/responses" copy-unmatched-params="true" />
+        <set-backend-service backend-id="agrag-responses-pool" />
+        <authentication-managed-identity resource="https://ai.azure.com" output-token-variable-name="managed-id-access-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["managed-id-access-token"])</value>
+        </set-header>
+        <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+        <set-header name="api-key" exists-action="delete" />
+        <set-variable name="backendAttempt" value="@(0)" />
+        <set-variable name="retryCount" value="@(int.Parse(&quot;{{agrag-openai-retrycount}}&quot;))" />
+    </inbound>
+    <backend>
+        <retry count="@((int)context.Variables[&quot;retryCount&quot;])" interval="0" first-fast-retry="true" condition="@(context.Response == null || context.Response.StatusCode == 408 || (context.Response.StatusCode == 409 &amp;&amp; context.Response.Headers.ContainsKey(&quot;Retry-After&quot;)) || context.Response.StatusCode == 429 || context.Response.StatusCode == 499 || context.Response.StatusCode == 500 || context.Response.StatusCode == 502 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504)">
+            <set-variable name="backendAttempt" value="@(((int)context.Variables[&quot;backendAttempt&quot;]) + 1)" />
+            <forward-request buffer-request-body="true" />
+            <set-variable name="backendHost" value="@(context.Request.Url.Host)" />
+        </retry>
+    </backend>
+    <outbound>
+        <set-variable name="backendRetry" value="@(Math.Max(0, ((int)context.Variables[&quot;backendAttempt&quot;]) - 1).ToString())" />
+        <set-header name="X-Backend-Retry" exists-action="override">
+            <value>@((string)context.Variables["backendRetry"])</value>
+        </set-header>
+        <set-header name="X-Backend-Host" exists-action="override">
+            <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("backendHost", "unknown"))</value>
+        </set-header>
+        <choose>
+            <when condition="@(context.Response != null &amp;&amp; (context.Response.StatusCode == 500 || context.Response.StatusCode == 502 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504))">
+                <return-response>
+                    <set-status code="503" reason="Inference Service Unavailable" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error":"Inference service is temporarily unavailable."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
