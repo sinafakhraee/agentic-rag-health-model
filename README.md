@@ -54,11 +54,11 @@ flowchart TD
 | **Agentic Research Assistant** (root) | Standard | rolls up dependencies (WorstOf) | Sev2 / Sev1 alerts, 99.9 objective |
 | **APIM AI Gateway** | Standard | derives from the backend pool (WorstOf) | pool Degraded → Unhealthy |
 | **Azure OpenAI backend pool** | Standard | MinHealthy over the 2 regions | 1 region down → Degraded, 0 → Unhealthy |
-| **Azure OpenAI — Primary / Secondary** | Standard | `AzureOpenAIAvailabilityRate`, `AzureOpenAITTLTInMS` (latency), 429 (Log Analytics) | see below |
+| **Azure OpenAI — Primary / Secondary** | Standard | `AzureOpenAIAvailabilityRate` **gated by `AzureOpenAIRequests`** (BestOf), `AzureOpenAITTLTInMS` (latency), 429 (Log Analytics) | see below |
 | **Foundry IQ knowledge base** | Standard | `SearchLatency`, `ThrottledSearchQueriesPercentage` | >1s / >5s, >5% / >20% |
 | **Scholarly-papers MCP server** | **Limited** | `Replicas`, `RestartCount` | replicas <1, restarts >2 / >5 |
 
-### Three modeling decisions worth calling out
+### Four modeling decisions worth calling out
 
 **1. `Limited` impact on the MCP tool.** If the scholarly tool is down, the agent still
 answers from the knowledge base — losing it is a lost *enhancement*, not an outage. So the MCP
@@ -73,14 +73,23 @@ early on, a single spike against a near-zero baseline reads as a false anomaly. 
 a predictable **static guardrail** (degraded > 8 s, unhealthy > 30 s) and calls out the dynamic
 option as the next step once the workload has history.
 
-**3. A Log Analytics 429 signal.** Azure OpenAI's `AzureOpenAIAvailabilityRate` is **5xx-based
+**3. Availability gated by request volume (`BestOf`).** `AzureOpenAIAvailabilityRate` is a ratio
+`(calls − 5xx) / calls`, so on a tiny denominator a single 5xx reads as a huge outage — the classic
+"100 % → 0 % on an idle endpoint" false positive. Following the Foundry health-models guidance, each
+region pairs availability with an `AzureOpenAIRequests` **volume gate** in a **`BestOf`** group. The
+gate signal is deliberately *inverted* — it reads **Unhealthy once traffic clears ≥ 20 calls / 5 min**,
+**Healthy below**. Because `BestOf` keeps the healthiest member, **below** the threshold the gate wins
+and availability can't false-alarm; **at/above** it the group follows real availability. The latency,
+429 and Resource Health signals still roll up independently.
+
+**4. A Log Analytics 429 signal.** Azure OpenAI's `AzureOpenAIAvailabilityRate` is **5xx-based
 and does not count 429s** — yet throttling is the most common way an LLM backend "fails". Each
 region carries an extra Log Analytics signal that counts HTTP 429s from the `RequestResponse`
 diagnostic logs (**>5 → Degraded, >20 → Unhealthy**), so rate-limiting is visible where the
 built-in availability metric is blind.
 
-A 1-minute **canary probe** (a Logic App) pings both regions so availability and latency stay
-populated on an idle workload — idle regions read **Healthy**, not **Unknown**.
+A 1-minute **canary probe** (a Logic App) keeps **latency** and Resource Health populated on an idle
+workload. Availability no longer depends on it — the `BestOf` volume gate handles the idle case directly.
 
 ---
 
@@ -126,14 +135,24 @@ the gateway's health mirrors the Azure OpenAI pool it fronts.
 degraded = 1, unhealthy = 0, ignoreUnknown)** over the two regions → 2 healthy = Healthy,
 1 = Degraded, 0 = Unhealthy.
 
-**Azure OpenAI — Primary / Secondary** — impact Standard · objective 99.5 · worst-of 4 signals:
+**Azure OpenAI — Primary / Secondary** — impact Standard · objective 99.5 · worst-of a **`BestOf`
+availability gate**, time-to-last-byte, 429 and Resource Health:
 
 | Signal | Source | Aggregation / grain | Threshold type | Degraded | Unhealthy |
 |---|---|---|---|---|---|
-| availability | `AzureOpenAIAvailabilityRate` (metric) | Average / 5 min | static | < 99% | < 95% |
+| availability *(gated)* | `AzureOpenAIAvailabilityRate` (metric) | Average / 5 min | static | ≤ 99% | ≤ 95% |
+| request-volume *(gate)* | `AzureOpenAIRequests` (metric) | Total / 5 min | static | — | ≥ 20 / 5 min |
 | time-to-last-byte | `AzureOpenAITTLTInMS` (metric) | Average / 5 min | **static** *(ML-ready — see below)* | > 8 s | > 30 s |
 | throttling-429 | KQL over `AzureDiagnostics` `RequestResponse` | count over trailing 5 min | static | > 5 (in 5 min) | > 20 (in 5 min) |
 | resource health | platform | — | — | degraded | unavailable |
+
+> **The `BestOf` availability gate.** `availability` and `request-volume` are combined in a **`BestOf`**
+> group (the healthiest member wins). The gate signal is *inverted* — it reads **Unhealthy once traffic is
+> high enough to trust the ratio** (≥ 20 calls / 5 min) and **Healthy below**. So under light traffic the
+> gate is the healthy member and masks a volatile availability reading (no "100 % → 0 % on two calls" false
+> positive); once real traffic arrives the group tracks true availability. Only `availability` +
+> `request-volume` are grouped — TTLB, 429 and Resource Health still roll up WorstOf. 429 is a 4xx, so it
+> never affects availability; the Log Analytics 429 signal below covers it.
 
 **Foundry IQ knowledge base (Azure AI Search)** — impact Standard · worst-of 3 signals:
 
@@ -222,8 +241,8 @@ region reads Unhealthy.) A bare `summarize` returns a single `0` row when idle, 
 ### Keeping idle signals alive
 
 A 1-minute **canary probe** (Logic App, managed identity) calls both regions' Responses endpoint
-so availability and latency stay populated even with no user traffic — idle regions read
-**Healthy**, not **Unknown**.
+so **latency** and Resource Health stay populated even with no user traffic. (Availability idle is
+handled by the `BestOf` request-volume gate above, not the probe.)
 
 ---
 
@@ -327,7 +346,8 @@ but **no alerts** — you investigate them from the graph once the root alert po
 - **Alert on state, at the root only** — one consolidated alert per impacting change, never a per-signal storm.
 - **`Limited` impact on the MCP tool** — a downed enhancement can only *degrade* the root, never page it as an outage.
 - **`ignoreUnknown` on roll-ups** — a dependency with no data goes Unknown and is *ignored*, instead of dragging the parent down and firing a spurious alert.
-- **A 1-minute canary probe** keeps availability/latency populated, so an *idle* region reads Healthy, not Unknown — no "quiet workload" false alarms.
+- **A `BestOf` request-volume gate on availability** — below ~20 calls / 5 min the region ignores a volatile availability ratio, killing the "100 % → 0 % on an idle endpoint" false positive at the source.
+- **A 1-minute canary probe** keeps latency / Resource Health populated, so an *idle* region reads Healthy, not Unknown — no "quiet workload" false alarms.
 - **A static latency guardrail** (not a cold-start dynamic threshold) avoids the fresh-baseline false anomaly; switch to dynamic once there's history.
 
 ### Minimizing false negatives (missed issues)

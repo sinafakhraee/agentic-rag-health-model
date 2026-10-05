@@ -54,6 +54,10 @@ param aoaiSecondaryOpenAiEndpoint string
 @description('Chat model/deployment the canary probe calls (must exist in both regions).')
 param probeModel string = 'gpt-4.1-mini'
 
+@description('Minimum Azure OpenAI requests in a 5-minute window before the availability signal is trusted (BestOf minimum-traffic gate). Below this count a region reads Healthy regardless of availability %, so a tiny denominator cannot throw a false positive.')
+@minValue(1)
+param aoaiMinRequests int = 20
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -243,7 +247,7 @@ resource aoaiPrimaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-09-
           {
             signalKind: 'AzureResourceMetric'
             name: 'availability'
-            displayName: 'Azure OpenAI availability rate (5xx-based)'
+            displayName: 'Azure OpenAI availability rate (5xx-based, gated by request volume)'
             refreshInterval: 'PT1M'
             dataUnit: 'Percent'
             metricNamespace: aoaiMetricNamespace
@@ -251,8 +255,26 @@ resource aoaiPrimaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-09-
             timeGrain: 'PT5M'
             aggregationType: 'Average'
             evaluationRules: {
-              degradedRule: { operator: 'LessThan', threshold: json('99') }
-              unhealthyRule: { operator: 'LessThan', threshold: json('95') }
+              degradedRule: { operator: 'LessThanOrEqual', threshold: json('99') }
+              unhealthyRule: { operator: 'LessThanOrEqual', threshold: json('95') }
+            }
+          }
+          {
+            // Minimum-traffic gate, paired with `availability` in the BestOf group below. The
+            // availability ratio swings wildly on a tiny denominator (one 5xx in two calls = 50%).
+            // This request-count signal is deliberately inverted: Unhealthy once traffic is high
+            // enough to trust availability (>= aoaiMinRequests / 5 min), Healthy below that.
+            signalKind: 'AzureResourceMetric'
+            name: 'request-volume'
+            displayName: 'Azure OpenAI request volume (availability gate)'
+            refreshInterval: 'PT1M'
+            dataUnit: 'Count'
+            metricNamespace: aoaiMetricNamespace
+            metricName: 'AzureOpenAIRequests'
+            timeGrain: 'PT5M'
+            aggregationType: 'Total'
+            evaluationRules: {
+              unhealthyRule: { operator: 'GreaterThanOrEqual', threshold: aoaiMinRequests }
             }
           }
           {
@@ -297,6 +319,18 @@ resource aoaiPrimaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-09-
         ]
       }
     }
+    // BestOf minimum-traffic gate: the entity's availability contribution = BestOf(availability,
+    // request-volume). Below aoaiMinRequests the gate signal is Healthy and wins (availability can't
+    // false-alarm on a tiny denominator); at/above it the group follows real availability.
+    // time-to-last-byte, throttling-429 and Resource Health still roll up WorstOf independently.
+    signalAggregationGroups: [
+      {
+        name: 'availability-reliability-gate'
+        displayName: 'Availability gated by request volume'
+        aggregationType: 'BestOf'
+        members: [ 'availability', 'request-volume' ]
+      }
+    ]
   }
 }
 
@@ -320,7 +354,7 @@ resource aoaiSecondaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-0
           {
             signalKind: 'AzureResourceMetric'
             name: 'availability'
-            displayName: 'Azure OpenAI availability rate (5xx-based)'
+            displayName: 'Azure OpenAI availability rate (5xx-based, gated by request volume)'
             refreshInterval: 'PT1M'
             dataUnit: 'Percent'
             metricNamespace: aoaiMetricNamespace
@@ -328,8 +362,26 @@ resource aoaiSecondaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-0
             timeGrain: 'PT5M'
             aggregationType: 'Average'
             evaluationRules: {
-              degradedRule: { operator: 'LessThan', threshold: json('99') }
-              unhealthyRule: { operator: 'LessThan', threshold: json('95') }
+              degradedRule: { operator: 'LessThanOrEqual', threshold: json('99') }
+              unhealthyRule: { operator: 'LessThanOrEqual', threshold: json('95') }
+            }
+          }
+          {
+            // Minimum-traffic gate, paired with `availability` in the BestOf group below. The
+            // availability ratio swings wildly on a tiny denominator (one 5xx in two calls = 50%).
+            // This request-count signal is deliberately inverted: Unhealthy once traffic is high
+            // enough to trust availability (>= aoaiMinRequests / 5 min), Healthy below that.
+            signalKind: 'AzureResourceMetric'
+            name: 'request-volume'
+            displayName: 'Azure OpenAI request volume (availability gate)'
+            refreshInterval: 'PT1M'
+            dataUnit: 'Count'
+            metricNamespace: aoaiMetricNamespace
+            metricName: 'AzureOpenAIRequests'
+            timeGrain: 'PT5M'
+            aggregationType: 'Total'
+            evaluationRules: {
+              unhealthyRule: { operator: 'GreaterThanOrEqual', threshold: aoaiMinRequests }
             }
           }
           {
@@ -374,6 +426,18 @@ resource aoaiSecondaryEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-0
         ]
       }
     }
+    // BestOf minimum-traffic gate: the entity's availability contribution = BestOf(availability,
+    // request-volume). Below aoaiMinRequests the gate signal is Healthy and wins (availability can't
+    // false-alarm on a tiny denominator); at/above it the group follows real availability.
+    // time-to-last-byte, throttling-429 and Resource Health still roll up WorstOf independently.
+    signalAggregationGroups: [
+      {
+        name: 'availability-reliability-gate'
+        displayName: 'Availability gated by request volume'
+        aggregationType: 'BestOf'
+        members: [ 'availability', 'request-volume' ]
+      }
+    ]
   }
 }
 
