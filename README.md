@@ -52,7 +52,7 @@ flowchart TD
 | Entity | Impact | Signals | Degraded → Unhealthy |
 |---|---|---|---|
 | **Agentic Research Assistant** (root) | Standard | rolls up dependencies (WorstOf) | Sev2 / Sev1 alerts, 99.9 objective |
-| **APIM AI Gateway** | Standard | derives from the backend pool (WorstOf) | pool Degraded → Unhealthy |
+| **APIM AI Gateway** | Standard | gateway `5xx` / `4xx` (`ApiManagementGatewayLogs`) + backend pool (WorstOf) | gw 5xx >5 / >20; else pool Degraded → Unhealthy |
 | **Azure OpenAI backend pool** | Standard | MinHealthy over the 2 regions | 1 region down → Degraded, 0 → Unhealthy |
 | **Azure OpenAI — Primary / Secondary** | Standard | `AzureOpenAIAvailabilityRate` **gated by `AzureOpenAIRequests`** (BestOf), `AzureOpenAITTLTInMS` (latency), 429 (Log Analytics) | see below |
 | **Foundry IQ knowledge base** | Standard | `SearchLatency`, `ThrottledSearchQueriesPercentage` | >1s / >5s, >5% / >20% |
@@ -121,15 +121,26 @@ metric becomes a health state, and where built-in ML (dynamic thresholds) fits.
 **Agentic Research Assistant (root)** — impact Standard · objective 99.9 · **WorstOf** over
 {APIM, Foundry IQ, MCP}. No direct signals. Alerts: **Sev1** on Unhealthy, **Sev2** on Degraded.
 
-**APIM AI Gateway** — impact Standard · **no direct signal** · WorstOf over the backend pool, so
-the gateway's health mirrors the Azure OpenAI pool it fronts.
+**APIM AI Gateway** — impact Standard · **WorstOf** over two gateway-plane error signals **and** the
+backend pool:
 
+| Signal | Source | Aggregation / grain | Degraded | Unhealthy |
+|---|---|---|---|---|
+| gateway-5xx | KQL over `ApiManagementGatewayLogs` (`ResponseCode ≥ 500`) | count / trailing 5 min | > 5 | > 20 |
+| gateway-4xx | KQL over `ApiManagementGatewayLogs` (`400–499`, **excl. 429**) | count / trailing 5 min | > 20 | > 100 |
+| backend pool | dependency rollup (WorstOf) | — | pool Degraded | pool Unhealthy |
+
+> **Gateway-plane vs backend-plane.** These two signals catch failures *only the gateway sees* —
+> policy / auth / routing errors, or a 5xx when the **whole** backend pool is unreachable — a different
+> layer from the backend 429 / availability the Azure OpenAI regions already report (those still
+> propagate up through the pool dependency). 429 is **excluded** from `gateway-4xx` so backend
+> throttling stays owned by the regions, not double-counted here. The queries use `union isfuzzy=true`
+> + a seeded `0` row, so the gateway reads **Healthy** (not Unknown) before any gateway traffic exists.
+>
 > **Why no Resource Health signal?** The **Consumption** APIM SKU isn't covered by Azure Resource
-> Health — it returns `Unknown` (*"We are currently unable to determine the health of this API
-> Management service"*), which renders as a **"?"** badge with no metric signal to offset it. So the
-> entity has no `azureResource` block and derives its state from its dependency. On a **dedicated**
-> APIM SKU (Developer/Basic/Standard/Premium), add back an `azureResource` block with `resourceHealth`
-> enabled — and/or a Log Analytics signal counting 5xx from `ApiManagementGatewayLogs`.
+> Health (it returns `Unknown` → a **"?"** badge). So the entity uses `ApiManagementGatewayLogs`
+> instead of an `azureResource` + `resourceHealth` block. On a **dedicated** APIM SKU
+> (Developer/Basic/Standard/Premium) you can additionally enable Resource Health.
 
 **Azure OpenAI backend pool** — impact Standard · no direct signals · **MinHealthy(Absolute,
 degraded = 1, unhealthy = 0, ignoreUnknown)** over the two regions → 2 healthy = Healthy,
@@ -354,6 +365,7 @@ but **no alerts** — you investigate them from the graph once the root alert po
 
 - **Alert on Degraded *and* Unhealthy** — partial impairment (one region down, throttling, slow Search) notifies instead of silently passing.
 - **Cover metric blind spots** — the Log Analytics **429** signal catches throttling that `AzureOpenAIAvailabilityRate` (5xx-only) misses.
+- **See gateway-layer failures** — APIM `gateway-5xx` / `gateway-4xx` signals surface policy/auth/routing errors and all-backends-down 5xx that the per-region backend signals can't see.
 - **Model grounding quality as `Standard`** — a Foundry IQ / Search failure can drive the root Unhealthy; an assistant that can't ground its answers isn't healthy even if the LLM path is fine.
 - **Keep signals live** — the canary means a genuinely dead region shows Unhealthy (real data), not an ignored Unknown.
 
@@ -456,7 +468,7 @@ annotated with what it does and which health signal should move.
 
 **Azure Monitor → Health models → `agentic-rag-health`.** The entity graph shows the root with
 its dependencies; colour is current health. Click a region to see availability, the
-time-to-last-byte band, and the 429 count; click the MCP server to see replicas and restarts.
+time-to-last-byte band, and the 429 count; click **APIM** to see its gateway 5xx / 4xx error counts; click the MCP server to see replicas and restarts.
 Watch how the MCP server going Unhealthy only makes the root **Degraded** (Limited impact),
 while an Azure OpenAI region or Search going Unhealthy can make the root **Unhealthy** (Standard).
 The root fires **Sev1** on Unhealthy and **Sev2** on Degraded to the action group.

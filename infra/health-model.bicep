@@ -61,7 +61,6 @@ param aoaiMinRequests int = 20
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-var apimMetricNamespace = 'Microsoft.ApiManagement/service'
 var aoaiMetricNamespace = 'Microsoft.CognitiveServices/accounts'
 var searchMetricNamespace = 'Microsoft.Search/searchServices'
 var acaMetricNamespace = 'Microsoft.App/containerApps'
@@ -76,6 +75,13 @@ var openAiUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefin
 // `summarize` returns a single 0 row when idle, so idle reads Healthy not Unknown.
 var kql429Primary = 'AzureDiagnostics | where TimeGenerated > ago(5m) | where _ResourceId =~ "${aoaiPrimaryResourceId}" | where Category == "RequestResponse" | summarize throttled = countif(ResultSignature == "429")'
 var kql429Secondary = 'AzureDiagnostics | where TimeGenerated > ago(5m) | where _ResourceId =~ "${aoaiSecondaryResourceId}" | where Category == "RequestResponse" | summarize throttled = countif(ResultSignature == "429")'
+
+// APIM gateway-plane error signals (failures only the gateway sees — distinct from the backend 429/5xx
+// the AOAI entities already report). `union isfuzzy=true` + a seeded 0 row keep the signal Healthy (not
+// Unknown) before any gateway traffic has created the ApiManagementGatewayLogs table. 429 is excluded
+// from the 4xx signal so backend throttling stays owned by the AOAI entities.
+var kqlApimGw5xx = 'union isfuzzy=true (print gw5xx = 0), (ApiManagementGatewayLogs | where TimeGenerated > ago(5m) | where _ResourceId =~ "${apimResourceId}" | where ResponseCode >= 500 | summarize gw5xx = count()) | summarize gw5xx = max(gw5xx)'
+var kqlApimGw4xx = 'union isfuzzy=true (print gw4xx = 0), (ApiManagementGatewayLogs | where TimeGenerated > ago(5m) | where _ResourceId =~ "${apimResourceId}" | where ResponseCode >= 400 and ResponseCode < 500 and ResponseCode != 429 | summarize gw4xx = count()) | summarize gw4xx = max(gw4xx)'
 
 // Existing AOAI accounts — referenced to attach RequestResponse diagnostic logs + probe RBAC.
 resource aoaiPrimaryAccount 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
@@ -100,6 +106,23 @@ resource diagSecondary 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview
   properties: {
     workspaceId: logAnalyticsWorkspaceResourceId
     logs: [ { category: 'RequestResponse', enabled: true } ]
+  }
+}
+
+// Existing APIM gateway — referenced to attach GatewayLogs diagnostics for the gateway error signals.
+resource apimService 'Microsoft.ApiManagement/service@2023-05-01-preview' existing = {
+  name: last(split(apimResourceId, '/'))
+}
+
+// Ship APIM GatewayLogs to the workspace. 'Dedicated' routes to the resource-specific
+// ApiManagementGatewayLogs table (clean ResponseCode column) the gateway signals query.
+resource diagApim 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'agentic-rag-apim-logs'
+  scope: apimService
+  properties: {
+    workspaceId: logAnalyticsWorkspaceResourceId
+    logAnalyticsDestinationType: 'Dedicated'
+    logs: [ { category: 'GatewayLogs', enabled: true } ]
   }
 }
 
@@ -196,10 +219,45 @@ resource apimEntity 'Microsoft.CloudHealth/healthmodels/entities@2026-09-01-prev
     icon: { iconName: 'ApiManagement' }
     impact: 'Standard'
     signalGroups: {
-      // APIM Consumption tier isn't covered by Azure Resource Health (it reports Unknown -> a "?"
-      // badge, with no metric signal to offset it). So the gateway's health is derived from the
-      // backend pool it fronts. On a dedicated APIM SKU, add an azureResource block with
-      // resourceHealth enabled (or an ApiManagementGatewayLogs 5xx Log Analytics signal).
+      // Gateway-plane error signals from ApiManagementGatewayLogs — failures only the gateway sees
+      // (policy / auth / routing, or 5xx when the whole backend pool is unreachable), on top of the
+      // backend pool it rolls up. Resource Health stays off: APIM Consumption isn't covered by it
+      // (would read Unknown -> a "?" badge). On a dedicated SKU you can additionally enable it.
+      azureLogAnalytics: {
+        authenticationSetting: authSettingName
+        logAnalyticsWorkspaceResourceId: logAnalyticsWorkspaceResourceId
+        signals: [
+          {
+            signalKind: 'LogAnalyticsQuery'
+            name: 'gateway-5xx'
+            displayName: 'Gateway 5xx responses (server / policy / routing errors, 5 min)'
+            refreshInterval: 'PT1M'
+            dataUnit: 'Count'
+            queryText: kqlApimGw5xx
+            timeGrain: 'PT5M'
+            valueColumnName: 'gw5xx'
+            evaluationRules: {
+              degradedRule: { operator: 'GreaterThan', threshold: json('5') }
+              unhealthyRule: { operator: 'GreaterThan', threshold: json('20') }
+            }
+          }
+          {
+            // 429 excluded — backend throttling is owned by the AOAI entities, not the gateway.
+            signalKind: 'LogAnalyticsQuery'
+            name: 'gateway-4xx'
+            displayName: 'Gateway 4xx responses (auth / client errors, excl. 429, 5 min)'
+            refreshInterval: 'PT1M'
+            dataUnit: 'Count'
+            queryText: kqlApimGw4xx
+            timeGrain: 'PT5M'
+            valueColumnName: 'gw4xx'
+            evaluationRules: {
+              degradedRule: { operator: 'GreaterThan', threshold: json('20') }
+              unhealthyRule: { operator: 'GreaterThan', threshold: json('100') }
+            }
+          }
+        ]
+      }
       dependencies: { aggregationType: 'WorstOf' }
     }
   }
