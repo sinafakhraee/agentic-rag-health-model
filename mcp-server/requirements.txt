@@ -1,0 +1,4 @@
+# mcp 2.0 removed the mcp.server.fastmcp import path, so pin to the 1.x line.
+mcp>=1.12.0,<2
+httpx>=0.27
+uvicorn>=0.30
